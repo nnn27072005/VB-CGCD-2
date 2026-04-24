@@ -118,7 +118,7 @@ def load_model(num_classes, model_name):
     if model_name == "dino_vitb16":
         model_name = "facebook/dino-vitb16"
 
-    model = AutoModel.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name, use_safetensors=True)
 
 
     peft_config = BOFTConfig(
