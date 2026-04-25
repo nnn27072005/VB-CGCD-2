@@ -84,7 +84,12 @@ dino_transform = transforms.Compose([
 ])
 
 def debias_dataset(backbone, projector, data_obj, batch_size, device):
-    """Extract debiased 384-dim features by passing images through backbone + projector."""
+    """Extract debiased 384-dim features using MLP output WITHOUT L2 normalization.
+    
+    The L2 norm projects features onto a unit sphere where Gaussian modeling
+    fails (det(cov) underflows to 0 in 384-dim). The MLP output is in
+    unconstrained Euclidean space — appropriate for MultivariateNormal.
+    """
     ds = ImageStageDataset(data_obj, transform=dino_transform)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
     feats = []
@@ -92,7 +97,7 @@ def debias_dataset(backbone, projector, data_obj, batch_size, device):
         for images, _, _ in loader:
             images = images.to(device)
             base_f = backbone(images).pooler_output
-            z, _ = projector(base_f)
+            z = projector.mlp(base_f)  # Pre-normalization: Euclidean, not spherical
             feats.append(z.cpu().numpy())
     return np.concatenate(feats, axis=0)
 
@@ -284,6 +289,17 @@ if __name__ == '__main__':
             debiased_test_old = debias_dataset(backbone, projector, test_old_data, args.batch_size, device)
             debiased_test_all = debias_dataset(backbone, projector, test_all_data, args.batch_size, device)
             debiased_known_test = debias_dataset(backbone, projector, known_test_data, args.batch_size, device)
+
+            # Standardize: zero mean + unit variance per dimension.
+            # This mirrors what PCA does for Stage 0, making identity covariance
+            # a valid initialization and preventing float32 det underflow.
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            debiased_features = scaler.fit_transform(debiased_features)
+            debiased_test = scaler.transform(debiased_test)
+            debiased_test_old = scaler.transform(debiased_test_old)
+            debiased_test_all = scaler.transform(debiased_test_all)
+            debiased_known_test = scaler.transform(debiased_known_test)
             # ==============================================================================
             # END: ACTIVE REPRESENTATION LEARNING LOOP
             # ==============================================================================
@@ -311,28 +327,24 @@ if __name__ == '__main__':
             print("Combined Pred Unique Counts:", np.unique(pred, return_counts=True))
 
             # ==============================================================================
-            # Re-initialize global_params in the debiased feature space
-            # Old-class params from Stage 0 are in PCA-384 space, NOT debiased-384 space.
-            # We must re-estimate them using Ledoit-Wolf shrinkage (robust with 25 samples/class).
+            # Re-initialize global_params in the standardized debiased feature space.
+            # Identity covariance is appropriate because features are standardized
+            # (zero mean, unit variance) — same property that PCA gives Stage 0.
+            # det(I) = 1, trivially PD, no float32 underflow.
             # ==============================================================================
             if s_classifier.global_params is not None:
                 old_debiased = debiased_features[old_mask]
                 old_labels = train_data._y[old_mask]
                 num_dim = debiased_features.shape[1]
 
-                # Pooled covariance from ALL old samples: 1250 samples >> 384 dims → full rank
-                # Per-class estimates (25 samples in 384D) are always singular/ill-conditioned.
-                pooled_cov = np.cov(old_debiased.T) + 1e-2 * np.eye(num_dim)
-
                 new_means = np.zeros((s_classifier.num_classes, num_dim))
-                new_covs = np.stack([pooled_cov] * s_classifier.num_classes)
+                new_covs = np.stack([np.eye(num_dim)] * s_classifier.num_classes)
 
                 for c in range(label_offset):
                     c_mask = old_labels == c
                     if c_mask.sum() > 0:
                         new_means[c] = old_debiased[c_mask].mean(axis=0)
 
-                # Novel class slots also get pooled_cov as a reasonable starting point
                 s_classifier.global_params = {
                     'class_means': jnp.array(new_means, dtype=jnp.float32),
                     'class_covs': jnp.array(new_covs, dtype=jnp.float32)
