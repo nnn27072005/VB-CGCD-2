@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import jax
+import jax.numpy as jnp
 
 from dataloaders.cifar100 import CIFAR100Loader
 from dataloaders.tinyimagenet import TinyImageNetLoader
@@ -81,6 +82,25 @@ dino_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 ])
+
+def debias_dataset(backbone, projector, data_obj, batch_size, device):
+    """Extract debiased 384-dim features by passing images through backbone + projector."""
+    ds = ImageStageDataset(data_obj, transform=dino_transform)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    feats = []
+    with torch.no_grad():
+        for images, _, _ in loader:
+            images = images.to(device)
+            base_f = backbone(images).pooler_output
+            z, _ = projector(base_f)
+            feats.append(z.cpu().numpy())
+    return np.concatenate(feats, axis=0)
+
+class SimpleData:
+    """Lightweight data wrapper with _x and _y attributes for the classifier."""
+    def __init__(self, x, y):
+        self._x = x
+        self._y = y
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -219,6 +239,8 @@ if __name__ == '__main__':
 
             for epoch in range(representation_epochs):
                 epoch_loss = 0.0
+                epoch_dict = {'loss_entropy_inter': 0, 'loss_entropy_old_in': 0, 'loss_entropy_new_in': 0, 'loss_contrastive': 0}
+                
                 for images, static_feats, labels in stage_loader:
                     images = images.to(device)
                     
@@ -240,45 +262,95 @@ if __name__ == '__main__':
                     optimizer.step()
                     
                     epoch_loss += loss.item()
+                    for k in epoch_dict.keys():
+                        epoch_dict[k] += loss_dict.get(k, 0.0)
                     
-                print(f"Epoch {epoch+1}/{representation_epochs} | Loss: {epoch_loss/len(stage_loader):.4f}")
+                n_batches = len(stage_loader)
+                print(f"Epoch {epoch+1}/{representation_epochs} | Loss: {epoch_loss/n_batches:.4f} "
+                      f"| Ent_Inter: {epoch_dict['loss_entropy_inter']/n_batches:.4f} "
+                      f"| Ent_Old: {epoch_dict['loss_entropy_old_in']/n_batches:.4f} "
+                      f"| Ent_New: {epoch_dict['loss_entropy_new_in']/n_batches:.4f} "
+                      f"| Contra: {epoch_dict['loss_contrastive']/n_batches:.4f}")
 
-            # Re-extract Debiased Features
+            # Re-extract Debiased Features for ALL datasets
             print(f"--- Re-extracting Features for VB Pipeline ---")
             projector.eval()
-            updated_features = []
-            
-            extract_loader = DataLoader(stage_dataset, batch_size=args.batch_size, shuffle=False)
-            with torch.no_grad():
-                for images, _, _ in extract_loader:
-                    images = images.to(device)
-                    base_features = backbone(images).pooler_output
-                    z_u, _ = projector(base_features)
-                    updated_features.append(z_u.cpu().numpy())
 
-            # DO NOT OVERWRITE static features! We need them for the Variational Bayes classifier to remain aligned with Stage 0!
-            debiased_features = np.concatenate(updated_features, axis=0)
+            # Training data
+            debiased_features = debias_dataset(backbone, projector, train_data, args.batch_size, device)
+
+            # All test sets — must be in the same debiased space
+            debiased_test = debias_dataset(backbone, projector, test_data, args.batch_size, device)
+            debiased_test_old = debias_dataset(backbone, projector, test_old_data, args.batch_size, device)
+            debiased_test_all = debias_dataset(backbone, projector, test_all_data, args.batch_size, device)
+            debiased_known_test = debias_dataset(backbone, projector, known_test_data, args.batch_size, device)
             # ==============================================================================
             # END: ACTIVE REPRESENTATION LEARNING LOOP
             # ==============================================================================
 
-            clustering = Clustering(num_classes=args.increment, label_offset=args.base + (i-1)*args.increment)
+            clustering = Clustering(num_classes=args.increment, label_offset=label_offset)
 
-            print(args.increment, (i-1)*args.increment)
+            print("Clustering novel classes:", args.increment, "Offset:", label_offset)
+            
+            # Separate old (replay buffer) and novel data
+            novel_mask = train_data._y >= label_offset
+            old_mask = ~novel_mask
+            
+            # 1. Fit clustering ONLY on the highly-separated Debiased Latent Space of NOVEL samples
+            novel_debiased_features = debiased_features[novel_mask]
+            clustering.fit(novel_debiased_features)
 
-            # Fit clustering on the highly-separated Debiased Latent Space
-            clustering.fit(debiased_features)
+            # 2. Predict pseudo-labels ONLY for novel features
+            novel_pred = clustering.predict(novel_debiased_features, train_data._y[novel_mask], with_known=False)
 
-            # Predict also on debiased features
-            pred = clustering.predict(debiased_features, train_data._y, with_known=True)
+            # 3. Construct the perfect pred array! 
+            # Replay buffer gets true old labels. Novel data gets clustering pseudo-labels!
+            pred = np.copy(train_data._y)
+            pred[novel_mask] = novel_pred
 
-            print(np.unique(pred, return_counts=True))
+            print("Combined Pred Unique Counts:", np.unique(pred, return_counts=True))
+
+            # ==============================================================================
+            # Re-initialize global_params in the debiased feature space
+            # Old-class params from Stage 0 are in PCA-384 space, NOT debiased-384 space.
+            # We must re-estimate them using Ledoit-Wolf shrinkage (robust with 25 samples/class).
+            # ==============================================================================
+            if s_classifier.global_params is not None:
+                from sklearn.covariance import LedoitWolf
+                old_debiased = debiased_features[old_mask]
+                old_labels = train_data._y[old_mask]
+                num_dim = debiased_features.shape[1]
+
+                new_means = np.zeros((s_classifier.num_classes, num_dim))
+                new_covs = np.stack([np.eye(num_dim)] * s_classifier.num_classes)
+
+                for c in range(label_offset):
+                    c_mask = old_labels == c
+                    if c_mask.sum() > 1:
+                        new_means[c] = old_debiased[c_mask].mean(axis=0)
+                        lw = LedoitWolf().fit(old_debiased[c_mask])
+                        new_covs[c] = lw.covariance_
+                    elif c_mask.sum() == 1:
+                        new_means[c] = old_debiased[c_mask][0]
+
+                s_classifier.global_params = {
+                    'class_means': jnp.array(new_means, dtype=jnp.float32),
+                    'class_covs': jnp.array(new_covs, dtype=jnp.float32)
+                }
+                s_classifier.pca = None  # Debiased features are already 384-dim
+                print(f"Re-initialized global_params for {label_offset} old classes in debiased space")
 
             # for ngmm merge
             s_classifier._set_label_offset(label_offset)
 
             s_classifier.update_dir_infos(log_dir=f"logs/{log_saved_dir}/log/stage{i}", save_dir=f"logs/{log_saved_dir}/saved_models/stage{i}")
 
-            testing_set = {'test_old': test_old_data, 'test_all': test_all_data, 'known_test': known_test_data}
+            # Build testing_set with debiased features
+            testing_set = {
+                'test_old': SimpleData(debiased_test_old, test_old_data._y),
+                'test_all': SimpleData(debiased_test_all, test_all_data._y),
+                'known_test': SimpleData(debiased_known_test, known_test_data._y)
+            }
 
-            s_classifier.run(train_data._x, pred, test_data._x, test_data._y, current_stage=i, testing_set=testing_set)
+            # Train and evaluate in the unified debiased feature space
+            s_classifier.run(debiased_features, pred, debiased_test, test_data._y, current_stage=i, testing_set=testing_set)
