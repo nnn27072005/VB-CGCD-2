@@ -231,7 +231,8 @@ if __name__ == '__main__':
                         z_u=z_u, 
                         logits=logits, 
                         old_class_indices=old_class_indices, 
-                        new_class_indices=new_class_indices
+                        new_class_indices=new_class_indices,
+                        base_features=base_features
                     )
                     
                     optimizer.zero_grad()

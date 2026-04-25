@@ -16,7 +16,7 @@ class Debiased_Representation_Loss(nn.Module):
         self.f1 = nn.Linear(feature_dim, hidden_dim)
         self.f2 = nn.Linear(feature_dim, hidden_dim)
 
-    def forward(self, z_u, logits, old_class_indices, new_class_indices):
+    def forward(self, z_u, logits, old_class_indices, new_class_indices, base_features):
         """
         Forward pass for the composite loss.
         
@@ -25,6 +25,7 @@ class Debiased_Representation_Loss(nn.Module):
             logits: Model logits corresponding to z_u, shape (B, num_classes)
             old_class_indices: List or tensor of old class indices, shape (C_old,)
             new_class_indices: List or tensor of new class indices, shape (C_new,)
+            base_features: Pre-trained ViT features used to construct stable neighborhood masks, shape (B, 768)
             
         Returns:
             total_loss: The combined debiased representation loss.
@@ -32,20 +33,21 @@ class Debiased_Representation_Loss(nn.Module):
         """
         device = z_u.device
         B, D = z_u.shape
-        num_classes = logits.shape[1]
         
         # ---------------------------------------------------------
         # Part A: Soft Entropy Regularization (HAPPY-CGCD)
         # ---------------------------------------------------------
-        # Convert logits to probabilities
-        probs = F.softmax(logits, dim=1)  # Shape: (B, num_classes)
+        # Mask out future classes to prevent probability leakage!
+        active_indices = old_class_indices + new_class_indices
+        probs = F.softmax(logits[:, active_indices], dim=1)  # Shape: (B, len(active_indices))
         
         # Compute marginal probabilities over the batch
-        mean_probs = probs.mean(dim=0)  # Shape: (num_classes,)
+        mean_probs = probs.mean(dim=0)  # Shape: (len(active_indices),)
         
         # Probability mass for old and new class sets
-        p_old = mean_probs[old_class_indices].sum()  # Scalar
-        p_new = mean_probs[new_class_indices].sum()  # Scalar
+        num_old = len(old_class_indices)
+        p_old = mean_probs[:num_old].sum()  # Scalar
+        p_new = mean_probs[num_old:].sum()  # Scalar
         
         # Inter-set entropy loss
         # Happy-CGCD minimizes the negative entropy (shifted) to maximize entropy
@@ -54,11 +56,11 @@ class Debiased_Representation_Loss(nn.Module):
         
         # Intra-set normalizations and entropy calculations
         # For old classes
-        p_old_in = mean_probs[old_class_indices] / (p_old + 1e-8)  # Shape: (C_old,)
+        p_old_in = mean_probs[:num_old] / (p_old + 1e-8)  # Shape: (C_old,)
         loss_entropy_old_in = torch.sum(p_old_in * torch.log(p_old_in + 1e-8)) + math.log(p_old_in.size(0))
         
         # For new classes
-        p_new_in = mean_probs[new_class_indices] / (p_new + 1e-8)  # Shape: (C_new,)
+        p_new_in = mean_probs[num_old:] / (p_new + 1e-8)  # Shape: (C_new,)
         if p_new_in.size(0) > 1:
             loss_entropy_new_in = torch.sum(p_new_in * torch.log(p_new_in + 1e-8)) + math.log(p_new_in.size(0))
         else:
@@ -70,15 +72,17 @@ class Debiased_Representation_Loss(nn.Module):
         # ---------------------------------------------------------
         # Part B: Soft Neighborhood Contrastive Loss (MetaGCD)
         # ---------------------------------------------------------
-        # L2 Normalize features
-        z_norm = F.normalize(z_u, p=2, dim=1)  # Shape: (B, D)
+        # L2 Normalize base features to construct stable neighborhood masks
+        base_norm = F.normalize(base_features, p=2, dim=1)  # Shape: (B, 768)
+        base_sim_matrix = torch.mm(base_norm, base_norm.t())  # Shape: (B, B)
         
-        # Compute cosine similarity matrix
-        sim_matrix = torch.mm(z_norm, z_norm.t())  # Shape: (B, B)
-        
-        # Generate boolean mask of candidate nearest neighbors NN(Z_i)
-        mask = sim_matrix > self.epsilon  # Shape: (B, B)
+        # Generate boolean mask of candidate nearest neighbors NN(Z_i) from BASE features!
+        mask = base_sim_matrix > self.epsilon  # Shape: (B, B)
         mask.fill_diagonal_(False)        # Avoid self-matching
+        
+        # L2 Normalize student features for InfoNCE
+        z_norm = F.normalize(z_u, p=2, dim=1)  # Shape: (B, D)
+        sim_matrix = torch.mm(z_norm, z_norm.t())  # Shape: (B, B)
         
         # Attention Module: linear projections f1 and f2
         f1_z = self.f1(z_u)  # Shape: (B, hidden_dim)
