@@ -255,8 +255,8 @@ if __name__ == '__main__':
                     z_u, _ = projector(base_features)
                     updated_features.append(z_u.cpu().numpy())
 
-            # OVERWRITE static features with debiased bottleneck features (Dim: 384)
-            train_data._x = np.concatenate(updated_features, axis=0)
+            # DO NOT OVERWRITE static features! We need them for the Variational Bayes classifier to remain aligned with Stage 0!
+            debiased_features = np.concatenate(updated_features, axis=0)
             # ==============================================================================
             # END: ACTIVE REPRESENTATION LEARNING LOOP
             # ==============================================================================
@@ -265,9 +265,11 @@ if __name__ == '__main__':
 
             print(args.increment, (i-1)*args.increment)
 
-            clustering.fit(train_data._x)
+            # Fit clustering on the highly-separated Debiased Latent Space
+            clustering.fit(debiased_features)
 
-            pred = clustering.predict(train_data._x, train_data._y, with_known=True)
+            # Predict also on debiased features
+            pred = clustering.predict(debiased_features, train_data._y, with_known=True)
 
             print(np.unique(pred, return_counts=True))
 

@@ -168,6 +168,9 @@ class MNGMMClassifier():
 
 
     def pre_processing(self, features, labels):
+        if features.shape[1] == self.num_dim:
+            return features, labels
+            
         if self.pca is None:
             self.pca = PCA(n_components=self.num_dim)
             features = self.pca.fit_transform(features)
