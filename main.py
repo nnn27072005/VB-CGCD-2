@@ -316,23 +316,23 @@ if __name__ == '__main__':
             # We must re-estimate them using Ledoit-Wolf shrinkage (robust with 25 samples/class).
             # ==============================================================================
             if s_classifier.global_params is not None:
-                from sklearn.covariance import LedoitWolf
                 old_debiased = debiased_features[old_mask]
                 old_labels = train_data._y[old_mask]
                 num_dim = debiased_features.shape[1]
 
+                # Pooled covariance from ALL old samples: 1250 samples >> 384 dims → full rank
+                # Per-class estimates (25 samples in 384D) are always singular/ill-conditioned.
+                pooled_cov = np.cov(old_debiased.T) + 1e-2 * np.eye(num_dim)
+
                 new_means = np.zeros((s_classifier.num_classes, num_dim))
-                new_covs = np.stack([np.eye(num_dim)] * s_classifier.num_classes)
+                new_covs = np.stack([pooled_cov] * s_classifier.num_classes)
 
                 for c in range(label_offset):
                     c_mask = old_labels == c
-                    if c_mask.sum() > 1:
+                    if c_mask.sum() > 0:
                         new_means[c] = old_debiased[c_mask].mean(axis=0)
-                        lw = LedoitWolf().fit(old_debiased[c_mask])
-                        new_covs[c] = lw.covariance_
-                    elif c_mask.sum() == 1:
-                        new_means[c] = old_debiased[c_mask][0]
 
+                # Novel class slots also get pooled_cov as a reasonable starting point
                 s_classifier.global_params = {
                     'class_means': jnp.array(new_means, dtype=jnp.float32),
                     'class_covs': jnp.array(new_covs, dtype=jnp.float32)

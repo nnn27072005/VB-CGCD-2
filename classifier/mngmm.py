@@ -198,10 +198,13 @@ class MNGMMClassifier():
             self.writer.add_scalar(f"Number/NovelSamples", novel_idx.sum().item(), current_stage)
             self.writer.add_scalar(f"Number/TotalSamples", len(features), current_stage)
 
-            features = features[novel_idx]
-            labels = labels[novel_idx]
+            if novel_idx.sum() > 0:
+                features = features[novel_idx]
+                labels = labels[novel_idx]
 
-            self.params = self.run_inference(jnp.array(features), jnp.array(labels), jnp.array(test_features), jnp.array(test_labels), log_prefix=f"stage_{current_stage}_Slearning", use_correct_scaling_factor=self.use_correct_scaling_factor)
+                self.params = self.run_inference(jnp.array(features), jnp.array(labels), jnp.array(test_features), jnp.array(test_labels), log_prefix=f"stage_{current_stage}_Slearning", use_correct_scaling_factor=self.use_correct_scaling_factor)
+            else:
+                print("WARNING: No novel samples found by Flearning — skipping Slearning")
         
         self.global_params = copy.deepcopy(self.params)
 
