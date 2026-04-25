@@ -83,7 +83,10 @@ class MNGMMClassifier():
             y_batch = y[ind] if y is not None else None
             
             if y_batch is not None:
-                base_dist = dist.MultivariateNormal(class_means[y_batch], class_covs[y_batch])
+                # Regularize: class_covs is unconstrained, so SVI can break
+                # positive-definiteness. Adding eps*I ensures Cholesky never fails.
+                class_covs_reg = class_covs + jnp.eye(num_features) * 1e-4
+                base_dist = dist.MultivariateNormal(class_means[y_batch], class_covs_reg[y_batch])
                 numpyro.sample("obs", base_dist, obs=X_batch)
 
 
@@ -231,6 +234,8 @@ class MNGMMClassifier():
     def _predict(self, X, params):
         class_means = params["class_means"]
         class_covs = params["class_covs"]
+        # Same regularization as in model() to prevent Cholesky failure
+        class_covs = class_covs + jnp.eye(class_covs.shape[-1]) * 1e-4
         log_probs = []
 
         for i in range(class_means.shape[0]):

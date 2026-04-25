@@ -39,7 +39,10 @@ class Debiased_Representation_Loss(nn.Module):
         # ---------------------------------------------------------
         # Mask out future classes to prevent probability leakage!
         active_indices = old_class_indices + new_class_indices
-        probs = F.softmax(logits[:, active_indices], dim=1)  # Shape: (B, len(active_indices))
+        # Temperature scaling: weight-normed logits are in [-1,1], so unscaled
+        # softmax over 60 classes is nearly uniform (entropy ≈ 0 always).
+        # Dividing by tau sharpens the distribution so entropy has gradients.
+        probs = F.softmax(logits[:, active_indices] / self.tau, dim=1)  # Shape: (B, len(active_indices))
         
         # Compute marginal probabilities over the batch
         mean_probs = probs.mean(dim=0)  # Shape: (len(active_indices),)
