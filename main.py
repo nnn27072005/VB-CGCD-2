@@ -66,7 +66,7 @@ class DINOProjectionHead(nn.Module):
         return x, logits
 
 def build_models(device, out_dim):
-    backbone = torch.hub.load('facebook/dino-vitb16', 'dino_vitb16')
+    backbone = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
     for param in backbone.parameters():
         param.requires_grad = False
     backbone.eval()  
