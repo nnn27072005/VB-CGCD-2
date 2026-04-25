@@ -66,7 +66,8 @@ class DINOProjectionHead(nn.Module):
         return x, logits
 
 def build_models(device, out_dim):
-    backbone = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
+    from transformers import AutoModel
+    backbone = AutoModel.from_pretrained('facebook/dino-vitb16')
     for param in backbone.parameters():
         param.requires_grad = False
     backbone.eval()  
@@ -222,7 +223,7 @@ if __name__ == '__main__':
                     images = images.to(device)
                     
                     with torch.no_grad():
-                        base_features = backbone(images)
+                        base_features = backbone(images).pooler_output
                         
                     z_u, logits = projector(base_features)
                     
@@ -250,7 +251,7 @@ if __name__ == '__main__':
             with torch.no_grad():
                 for images, _, _ in extract_loader:
                     images = images.to(device)
-                    base_features = backbone(images)
+                    base_features = backbone(images).pooler_output
                     z_u, _ = projector(base_features)
                     updated_features.append(z_u.cpu().numpy())
 
